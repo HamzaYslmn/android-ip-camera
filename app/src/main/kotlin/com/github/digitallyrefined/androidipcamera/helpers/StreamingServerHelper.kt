@@ -3,6 +3,9 @@ package com.github.digitallyrefined.androidipcamera.helpers
 import android.content.Context
 import android.Manifest
 import android.content.pm.PackageManager
+import android.graphics.SurfaceTexture
+import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraManager
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
@@ -47,14 +50,16 @@ class StreamingServerHelper(
     private val onLog: (String) -> Unit = {},
     private val onClientConnected: () -> Unit = {},
     private val onClientDisconnected: () -> Unit = {},
-    private val onControlCommand: (String, String) -> Unit = { _, _ -> }
+    private val onControlCommand: (String, String) -> Unit = { _, _ -> },
+    private val onControls: (String) -> String = { "[]" }
 ) {
     data class Client(
         val socket: Socket,
         val outputStream: OutputStream,
         val writer: PrintWriter,
         val connectedAt: Long = System.currentTimeMillis(),
-        val isAuthenticated: Boolean = false
+        val isAuthenticated: Boolean = false,
+        @Volatile var waitingKey: Boolean = true // H.264: skip frames until first keyframe
     )
 
     private data class FailedAttempt(
@@ -68,6 +73,7 @@ class StreamingServerHelper(
     @Volatile
     private var isStarting = false
     private val clients = CopyOnWriteArrayList<Client>()
+    private val h264Clients = CopyOnWriteArrayList<Client>()  // raw H.264 (/h264) viewers
     private val failedAttempts = ConcurrentHashMap<String, FailedAttempt>()
     @Volatile
     private var appInForeground: Boolean = true
@@ -84,6 +90,13 @@ class StreamingServerHelper(
     private val SOCKET_TIMEOUT_MS = 60 * 1000 // 60 seconds socket timeout
 
     fun getClients(): List<Client> = clients.toList()
+    fun getH264Clients(): List<Client> = h264Clients.toList()
+    fun resetH264Wait() { h264Clients.forEach { it.waitingKey = true } }  // resync viewers at next keyframe
+    fun removeH264Client(client: Client) {
+        h264Clients.remove(client)
+        try { client.socket.close() } catch (_: Exception) {}
+        onClientDisconnected()
+    }
 
     fun stopServer() {
         serverJob?.cancel()
@@ -428,7 +441,7 @@ class StreamingServerHelper(
 
             // Check if authentication is enabled
             val prefs = PreferenceManager.getDefaultSharedPreferences(context)
-            val enableAuth = prefs.getBoolean("enable_auth", true)
+            var enableAuth = prefs.getBoolean("enable_auth", false) // fork default: off (LAN + proxy); toggle in settings
 
             // Validate stored credentials if auth is enabled
             val username = if (enableAuth) {
@@ -442,20 +455,11 @@ class StreamingServerHelper(
                 null
             }
 
-            if (enableAuth) {
-                if (username == null || password == null || username.isEmpty() || password.isEmpty()) {
-                    // CRITICAL: No valid credentials configured - reject all connections
-                    recordFailedAttempt(clientIp)
-                    writer.print("HTTP/1.1 403 Forbidden\r\n")
-                    writer.print("Content-Type: text/plain\r\n")
-                    writer.print("Connection: close\r\n\r\n")
-                    writer.print("SECURITY ERROR: Authentication credentials not properly configured.\r\n")
-                    writer.print("Configure username and password in app settings.\r\n")
-                    writer.flush()
-                    socket.close()
-                    onLog("SECURITY: Connection rejected - authentication credentials not configured")
-                    return
-                }
+            // Fork: if auth is enabled but credentials aren't configured, fall back to OPEN rather than
+            // locking everyone out with 403 (LAN device behind the FastAPI proxy). Prevents auth-bricking.
+            if (enableAuth && (username.isNullOrEmpty() || password.isNullOrEmpty())) {
+                enableAuth = false
+                onLog("auth enabled but no credentials -> serving open")
             }
 
             // Read HTTP headers
@@ -592,6 +596,16 @@ class StreamingServerHelper(
                 return
             }
 
+            if (uri.startsWith("/controls")) {
+                // Per-API supported controls for the current camera. ?backend=camera1-gl|camera2-gl|camerax-*
+                val backend = if (uri.contains("?")) uri.substringAfter("backend=", "").substringBefore("&") else ""
+                val json = onControls(if (backend.isEmpty()) "camera1-gl" else backend)
+                writer.print("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n")
+                writer.print(json); writer.flush()
+                try { socket.close() } catch (_: Exception) {}
+                return
+            }
+
             if (uri.contains("?")) {
                 val query = uri.substringAfter("?")
                 query.split("&").forEach { param ->
@@ -704,6 +718,85 @@ class StreamingServerHelper(
                     } finally {
                         try { socket.close() } catch (_: Exception) {}
                     }
+                }
+                return
+            }
+
+            if (uri.startsWith("/cameras")) {
+                // One list, all properties: each camera with its OWN supported live sizes
+                // (sizes/formats differ per camera). Capped to the device's queried HW encoder ceiling.
+                val encCaps = H264Encoder.caps()
+                val cm = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+                val idle = clients.isEmpty() && h264Clients.isEmpty()
+                val sb = StringBuilder("[")
+                try {
+                    cm.cameraIdList.forEachIndexed { i, id ->
+                        val ch = cm.getCameraCharacteristics(id)
+                        val facing = when (ch.get(CameraCharacteristics.LENS_FACING)) {
+                            CameraCharacteristics.LENS_FACING_FRONT -> "front"
+                            CameraCharacteristics.LENS_FACING_BACK -> "back"
+                            else -> "external"
+                        }
+                        val set = LinkedHashSet<Pair<Int, Int>>()
+                        try {
+                            val map = ch.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+                            map?.getOutputSizes(SurfaceTexture::class.java)?.forEach { set.add(it.width to it.height) }
+                            map?.getOutputSizes(android.media.MediaCodec::class.java)?.forEach { set.add(it.width to it.height) }
+                        } catch (_: Exception) {}
+                        if (idle) {  // Camera1 preview sizes expose 16:9 that LEGACY Camera2 omits
+                            try {
+                                @Suppress("DEPRECATION") val c1 = android.hardware.Camera.open(id.toIntOrNull() ?: i)
+                                @Suppress("DEPRECATION") c1.parameters.supportedPreviewSizes?.forEach { set.add(it.width to it.height) }
+                                @Suppress("DEPRECATION") c1.release()
+                            } catch (_: Exception) {}
+                        }
+                        val sizes = set.filter { it.first <= encCaps.maxW && it.second <= encCaps.maxH }.sortedByDescending { it.first * it.second }
+                        // manual-control capabilities (ranges differ per camera/hardware level)
+                        val evR = ch.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE)
+                        val evStep = ch.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_STEP)
+                            ?.let { it.numerator.toDouble() / it.denominator } ?: 0.0
+                        val fpsMax = ch.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
+                            ?.maxOfOrNull { it.upper } ?: 30
+                        val manual = ch.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)
+                            ?.contains(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR) == true
+                        val isoR = ch.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
+                        val isoJson = if (manual && isoR != null) "{\"min\":${isoR.lower},\"max\":${isoR.upper}}" else "null"
+                        if (i > 0) sb.append(",")
+                        sb.append("{\"id\":\"$id\",\"facing\":\"$facing\",")
+                        sb.append("\"ev\":{\"min\":${evR?.lower ?: 0},\"max\":${evR?.upper ?: 0},\"step\":$evStep},")
+                        sb.append("\"fpsMax\":$fpsMax,\"iso\":$isoJson,\"sizes\":[")
+                        sizes.forEachIndexed { j, s -> if (j > 0) sb.append(","); sb.append("{\"w\":${s.first},\"h\":${s.second}}") }
+                        sb.append("]}")
+                    }
+                } catch (_: Exception) {}
+                sb.append("]")
+                writer.print("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n")
+                writer.print(sb.toString()); writer.flush()
+                try { socket.close() } catch (_: Exception) {}
+                return
+            }
+
+            if (uri.startsWith("/h264")) {
+                // Raw Annex-B H.264 elementary stream (hardware-encoded). Browser plays via jMuxer.
+                if (handleMaxClients(socket, isAuthenticated = enableAuth)) return
+                writer.print("HTTP/1.1 200 OK\r\n")
+                writer.print("Connection: keep-alive\r\n")
+                writer.print("Cache-Control: no-cache, no-store, must-revalidate\r\n")
+                writer.print("Content-Type: video/h264\r\n\r\n")
+                writer.flush()
+                val client = Client(socket, outputStream, writer, System.currentTimeMillis(), isAuthenticated = enableAuth)
+                h264Clients.add(client)
+                onClientConnected()  // starts camera + encoder
+                try {
+                    while (socket.isConnected && !socket.isClosed) {
+                        if (reader.ready()) { if (reader.readLine() == null) break }
+                        Thread.sleep(1000)
+                    }
+                } catch (_: Exception) {
+                } finally {
+                    h264Clients.remove(client)
+                    try { socket.close() } catch (_: Exception) {}
+                    onClientDisconnected()
                 }
                 return
             }

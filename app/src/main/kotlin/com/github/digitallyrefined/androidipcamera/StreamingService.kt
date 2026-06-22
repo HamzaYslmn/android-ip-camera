@@ -57,7 +57,11 @@ class StreamingService : LifecycleService() {
     private var camera: androidx.camera.core.Camera? = null
     private var lastFrameTime = 0L
     private var lensFacing = CameraSelector.DEFAULT_BACK_CAMERA
-    private var cameraResolutionHelper: CameraResolutionHelper? = null
+    private var h264Encoder: H264Encoder? = null
+    private var glPipe: CameraGlPipe? = null
+    private var camera2Capture: Camera2Capture? = null
+    private var camera1Capture: Camera1Capture? = null
+    @Volatile private var captureRunning = false  // true while a native (Camera1/Camera2) backend is active
 
     // UI Callbacks
     var onClientConnected: (() -> Unit)? = null
@@ -228,25 +232,14 @@ class StreamingService : LifecycleService() {
     }
 
     fun setPreviewSurface(surfaceProvider: Preview.SurfaceProvider?) {
+        // Headless server: just remember the provider; do NOT restart the camera here. The activity
+        // fires this on every resume/pause, and restarting on each one raced with the explicit
+        // front/back switch (loop / wrong camera). The camera is driven by client connections only.
         currentSurfaceProvider = surfaceProvider
-        if (isCameraRunning() && surfaceProvider != null) {
-            // Re-bind to include preview if needed, or update preview
-            // CameraX is tricky with dynamic surface updates.
-            // Usually we just need to restart camera to attach new preview.
-            startCamera()
-        } else if (isCameraRunning() && surfaceProvider == null) {
-            // If surface is null (backgrounded), we might want to unbind preview to save resources,
-            // or just let it be (CameraX handles detached surfaces).
-            // However, to be safe and ensure background streaming works, we should keep the camera running
-            // but maybe without the Preview use case if it causes issues.
-            // For now, let's just restart camera without preview if surface is null?
-            // Actually, if we just unbindAll and rebind with/without Preview, that works.
-            startCamera()
-        }
     }
 
     fun isCameraRunning(): Boolean {
-        return camera != null
+        return camera != null || captureRunning
     }
 
     fun getLocalIpAddress(): String {
@@ -277,8 +270,7 @@ class StreamingService : LifecycleService() {
                 if (lensFacing == CameraSelector.DEFAULT_FRONT_CAMERA) CAMERA_FACING_FRONT else CAMERA_FACING_BACK
             )
             .apply()
-        cameraResolutionHelper = null
-        if (streamingServerHelper?.getClients()?.isNotEmpty() == true) {
+        if (isCameraRunning()) {
             startCamera()
         }
     }
@@ -342,14 +334,17 @@ class StreamingService : LifecycleService() {
                     }
                 },
                 onClientDisconnected = {
-                    if (streamingServerHelper?.getClients()?.isEmpty() == true) {
+                    val noMjpeg = streamingServerHelper?.getClients()?.isEmpty() == true
+                    val noH264 = streamingServerHelper?.getH264Clients()?.isEmpty() == true
+                    if (noMjpeg && noH264) {
                         launchMain {
                             stopCamera()
                             onClientDisconnected?.invoke()
                         }
                     }
                 },
-                onControlCommand = { key: String, value: String -> handleRemoteControl(key, value) }
+                onControlCommand = { key: String, value: String -> handleRemoteControl(key, value) },
+                onControls = { backend -> controlsJson(backend) }
             )
         }
         streamingServerHelper?.startStreamingServer()
@@ -363,68 +358,240 @@ class StreamingService : LifecycleService() {
     }
 
     private fun startCameraIfNeeded() {
-        if (!allPermissionsGranted() || isCameraRunning()) return
-        startCamera()
+        if (!allPermissionsGranted()) return
+        if (!isCameraRunning()) { startCamera(); return }
+        // An /h264 viewer joined while the camera was bound without an encoder -> rebind with the backend.
+        val needH264 = streamingServerHelper?.getH264Clients()?.isNotEmpty() == true
+        if (needH264 && h264Encoder == null) startCamera()
     }
 
     private fun stopCamera() {
         cameraProvider?.unbindAll()
+        camera2Capture?.stop(); camera2Capture = null
+        camera1Capture?.stop(); camera1Capture = null
+        glPipe?.stop(); glPipe = null
+        h264Encoder?.stop()
+        h264Encoder = null
         imageAnalyzer = null
         camera = null
+        captureRunning = false
+    }
+
+    private fun broadcastH264(data: ByteArray, isKey: Boolean) {
+        val list = streamingServerHelper?.getH264Clients() ?: return
+        for (c in list) {
+            try {
+                if (c.waitingKey) {
+                    if (!isKey) continue
+                    c.waitingKey = false
+                }
+                c.outputStream.write(data)
+                c.outputStream.flush()
+            } catch (e: Exception) {
+                streamingServerHelper?.removeH264Client(c)
+            }
+        }
+    }
+
+    private fun bitrateFor(w: Int, h: Int): Int = H264Encoder.bitrateFor(w, h)
+
+    // Preset height for the resolution keyword (the device picks its nearest native size).
+    private fun presetHeight(q: String): Int = when (q) {
+        "1080", "fhd", "high" -> 1080
+        "720", "hd", "medium" -> 720
+        "480", "low" -> 480
+        else -> 720
+    }
+
+    // The active camera id, used to namespace settings so every camera is independent.
+    private fun camId(): String = getCameraId(getSystemService(Context.CAMERA_SERVICE) as CameraManager)
+
+    // Generic per-camera control vocabulary (shared with CameraControls / the dashboard).
+    private val ctlKeys = listOf("exposure", "fps", "iso", "wb", "effect", "scene",
+        "focusmode", "antibanding", "stabilization", "zoom")
+
+    // Stored per-camera control values (camera_<key>_<id>) handed to a capture at start.
+    private fun extrasFor(id: String): Map<String, String> {
+        val p = PreferenceManager.getDefaultSharedPreferences(this)
+        val m = HashMap<String, String>()
+        for (k in ctlKeys) p.getString("camera_${k}_$id", null)?.let { m[k] = it }
+        return m
+    }
+
+    /**
+     * Per-backend supported controls as JSON, so the UI shows exactly what THIS api can do on the
+     * current camera. Camera2 reads characteristics (no open needed). Camera1 needs an open camera:
+     * use the live capture if camera1-gl is streaming, else a brief idle open (fails if another
+     * backend holds the camera). CameraX exposes a fixed minimal set.
+     */
+    private fun controlsJson(backend: String): String {
+        val id = camId()
+        val cur = { k: String -> PreferenceManager.getDefaultSharedPreferences(this).getString("camera_${k}_$id", null) }
+        return try {
+            when {
+                backend.startsWith("camera2") -> {
+                    val cm = getSystemService(Context.CAMERA_SERVICE) as CameraManager
+                    CameraControls.camera2Json(cm.getCameraCharacteristics(id), cur)
+                }
+                backend.startsWith("camera1") -> camera1Capture?.controlsJson(cur) ?: run {
+                    @Suppress("DEPRECATION") val c = android.hardware.Camera.open(camera1IdForFacing())
+                    try { CameraControls.camera1Json(c.parameters, cur) } finally { @Suppress("DEPRECATION") c.release() }
+                }
+                else -> CameraControls.cameraxJson(cur)
+            }
+        } catch (e: Exception) { Log.w(TAG, "controlsJson($backend): ${e.message}"); "[]" }
+    }
+
+    /**
+     * Single size resolver used by EVERY backend so resolution is consistent across them.
+     *  - An explicit device size (camera_size_<id>="WxH") wins.
+     *  - Else pick the camera's native SurfaceTexture size nearest the preset height (keeps the
+     *    sensor's real aspect ratio; tiebreak = widest).
+     *  - Always capped to the device's queried AVC encoder max.
+     * [onlyCamera2Sizes]=true restricts to Camera2 SurfaceTexture-listed sizes (camera2-gl can't
+     * stream a Camera1-only size, e.g. a LEGACY 16:9 omission), falling back to nearest native.
+     */
+    private fun targetSize(cameraId: String, onlyCamera2Sizes: Boolean = false): Size {
+        val caps = H264Encoder.caps()
+        fun cap(s: Size) = Size(minOf(s.width, caps.maxW), minOf(s.height, caps.maxH))
+
+        val native = try {
+            val cm = getSystemService(Context.CAMERA_SERVICE) as CameraManager
+            cm.getCameraCharacteristics(cameraId).get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+                ?.getOutputSizes(android.graphics.SurfaceTexture::class.java)?.toList().orEmpty()
+        } catch (e: Exception) { emptyList() }
+
+        val prefs = PreferenceManager.getDefaultSharedPreferences(this)
+        val want = Regex("(\\d+)x(\\d+)").find(prefs.getString("camera_size_$cameraId", "") ?: "")?.let {
+            Size(it.groupValues[1].toInt(), it.groupValues[2].toInt())
+        }
+
+        // Explicit size: honour it unless camera2-gl can't actually stream it.
+        if (want != null && !(onlyCamera2Sizes && native.none { it.width == want.width && it.height == want.height }))
+            return cap(want)
+
+        val targetH = want?.height ?: presetHeight(prefs.getString("camera_resolution_$cameraId", "1080") ?: "1080")
+        val pick = native.minByOrNull { kotlin.math.abs(it.height - targetH) * 10000 - it.width } ?: Size(1280, 720)
+        return cap(pick)
+    }
+
+    private fun feedH264(image: ImageProxy) {
+        var enc = h264Encoder
+        if (enc == null || enc.width != image.width || enc.height != image.height) {
+            enc?.stop()
+            enc = H264Encoder(image.width, image.height, 30, bitrateFor(image.width, image.height), false) { d, k -> broadcastH264(d, k) }
+            h264Encoder = enc
+            enc.requestKeyFrame()
+            streamingServerHelper?.resetH264Wait()
+        }
+        enc.feed(image, image.imageInfo.timestamp / 1000)
     }
 
     private fun startCamera() {
+        val backend = PreferenceManager.getDefaultSharedPreferences(this)
+            .getString("capture_backend", "camerax-analysis") ?: "camerax-analysis"
+        when (backend) {
+            "camera2-gl" -> startNativeGl(useCamera2 = true)
+            "camera1-gl" -> startNativeGl(useCamera2 = false)
+            else -> startCameraX()  // camerax-gl, camerax-analysis, mjpeg
+        }
+    }
+
+    // Native (Camera2/Camera1) -> GL pipe -> HW encoder. Zero CPU copy; serves /h264 only.
+    // Encoder/pipe are sized to the camera's ACTUAL output, so the resolution is exact (no 1440 vs 1920
+    // surprise) and there is NO silent backend swap.
+    private fun startNativeGl(useCamera2: Boolean) {
+        if (streamingServerHelper?.getH264Clients().isNullOrEmpty()) { startCameraX(); return }
+        stopCamera()
+        val camId = getCameraId(getSystemService(Context.CAMERA_SERVICE) as CameraManager)
+        val torchOn = PreferenceManager.getDefaultSharedPreferences(this).getString("camera_torch_$camId", "off") == "on"
+        val extras = extrasFor(camId)
+        try {
+            if (useCamera2) {
+                val sz = targetSize(camId, onlyCamera2Sizes = true)  // Camera2 SurfaceTexture-supported size
+                val pipe = newPipe(sz)
+                camera2Capture = Camera2Capture(this, camId, pipe.inputSurface, extras).also { it.start() }
+            } else {
+                val want = targetSize(camId)
+                val cap = Camera1Capture(camera1IdForFacing(), want.width, want.height, extras)  // opens + picks real size
+                val pipe = newPipe(Size(cap.chosenW, cap.chosenH))  // encoder = exactly what Camera1 delivers
+                cap.start(pipe.surfaceTexture)
+                camera1Capture = cap
+            }
+            captureRunning = true
+            setTorchAll(torchOn)
+        } catch (e: Exception) {
+            Log.e(TAG, "native backend start failed: ${e.message}")
+            stopCamera()
+        }
+    }
+
+    private fun newPipe(sz: Size): CameraGlPipe {
+        val enc = H264Encoder(sz.width, sz.height, 30, bitrateFor(sz.width, sz.height), true) { d, k -> broadcastH264(d, k) }
+        h264Encoder = enc
+        streamingServerHelper?.resetH264Wait()
+        return CameraGlPipe(enc.inputSurface!!, sz.width, sz.height).also { it.start(); glPipe = it }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun camera1IdForFacing(): Int {
+        val pref = PreferenceManager.getDefaultSharedPreferences(this).getString("camera_id", "") ?: ""
+        pref.toIntOrNull()?.let { if (it in 0 until android.hardware.Camera.getNumberOfCameras()) return it }
+        val want = if (lensFacing == CameraSelector.DEFAULT_FRONT_CAMERA)
+            android.hardware.Camera.CameraInfo.CAMERA_FACING_FRONT
+        else android.hardware.Camera.CameraInfo.CAMERA_FACING_BACK
+        val info = android.hardware.Camera.CameraInfo()
+        for (i in 0 until android.hardware.Camera.getNumberOfCameras()) {
+            android.hardware.Camera.getCameraInfo(i, info)
+            if (info.facing == want) return i
+        }
+        return 0
+    }
+
+    private fun setTorchAll(on: Boolean) {
+        try { camera?.cameraControl?.enableTorch(on) } catch (_: Exception) {}
+        camera2Capture?.setTorch(on)
+        camera1Capture?.setTorch(on)
+    }
+
+    private fun triggerFocusAll() {
+        camera2Capture?.triggerAutoFocus()
+        camera1Capture?.triggerAutoFocus()
+        try {
+            val cam = camera ?: return
+            val f = androidx.camera.core.SurfaceOrientedMeteringPointFactory(1f, 1f)
+            cam.cameraControl.startFocusAndMetering(
+                androidx.camera.core.FocusMeteringAction.Builder(f.createPoint(0.5f, 0.5f)).build())
+        } catch (_: Exception) {}
+    }
+
+    private fun startCameraX() {
         val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
 
         cameraProviderFuture.addListener({
             val cameraProvider = cameraProviderFuture.get()
             this.cameraProvider = cameraProvider
-
-            // Initialize camera resolution helper if not already done
-            if (cameraResolutionHelper == null) {
-                cameraResolutionHelper = CameraResolutionHelper(this)
-                val cameraManager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
-                val cameraId = getCameraId(cameraManager)
-                cameraResolutionHelper?.initializeResolutions(cameraId)
-            }
+            val camId = getCameraId(getSystemService(Context.CAMERA_SERVICE) as CameraManager)
 
             // Image Analysis (Streaming)
             imageAnalyzer = ImageAnalysis.Builder()
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                 .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
                 .apply {
-                    val prefs = PreferenceManager.getDefaultSharedPreferences(this@StreamingService)
-                    val quality = prefs.getString("camera_resolution", "low") ?: "low"
-                    val targetResolution = cameraResolutionHelper?.getResolutionForQuality(quality)
-
-                    if (targetResolution != null) {
-                        setResolutionSelector(
-                            ResolutionSelector.Builder()
-                                .setResolutionStrategy(ResolutionStrategy(targetResolution, ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER))
-                                .build()
-                        )
-                    } else {
-                        // Fallback
-                         val fallbackResolution = when (quality) {
-                            "high" -> Size(1280, 720)
-                            "medium" -> Size(960, 720)
-                            "low" -> Size(800, 600)
-                            else -> Size(800, 600)
-                        }
-                        setResolutionSelector(
-                            ResolutionSelector.Builder()
-                                .setResolutionStrategy(ResolutionStrategy(fallbackResolution, ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER))
-                                .build()
-                        )
-                    }
+                    val target = targetSize(camId)
+                    setResolutionSelector(
+                        ResolutionSelector.Builder()
+                            .setResolutionStrategy(ResolutionStrategy(target, ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER))
+                            .build()
+                    )
                 }
                 .build()
                 .also { analysis ->
                     cameraExecutor?.let { executor ->
                         analysis.setAnalyzer(executor) { image ->
-                            if (streamingServerHelper?.getClients()?.isNotEmpty() == true) {
-                                processImage(image)
-                            }
+                            val helper = streamingServerHelper
+                            if (helper?.getClients()?.isNotEmpty() == true) processImage(image)
+                            if (helper?.getH264Clients()?.isNotEmpty() == true) feedH264(image)
                             image.close()
                         }
                     }
@@ -433,14 +600,37 @@ class StreamingService : LifecycleService() {
             try {
                 cameraProvider.unbindAll()
 
-                // Build Use Cases
-                val useCases = mutableListOf<androidx.camera.core.UseCase>(imageAnalyzer!!)
+                // Build Use Cases. Headless: never bind the on-device UI Preview (stalls camera screen-off).
+                val prefs = PreferenceManager.getDefaultSharedPreferences(this@StreamingService)
+                val needH264 = streamingServerHelper?.getH264Clients()?.isNotEmpty() == true
+                val needMjpeg = streamingServerHelper?.getClients()?.isNotEmpty() == true
+                val useCases = mutableListOf<androidx.camera.core.UseCase>()
 
-                // Add Preview if surface provider is available
-                if (currentSurfaceProvider != null) {
-                    val preview = Preview.Builder().build()
-                    preview.setSurfaceProvider(currentSurfaceProvider)
+                val backend = prefs.getString("capture_backend", "camerax-analysis") ?: "camerax-analysis"
+                if (needH264 && !needMjpeg && backend == "camerax-gl") {
+                    // Zero-copy GL path: CameraX Preview -> SurfaceTexture (real frames on LEGACY) ->
+                    // GL draws into the HW encoder input surface. Targets 1080p30.
+                    val target = targetSize(camId)
+                    val preview = Preview.Builder()
+                        .setResolutionSelector(
+                            ResolutionSelector.Builder()
+                                .setResolutionStrategy(ResolutionStrategy(target, ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER))
+                                .build()
+                        ).build()
+                    preview.setSurfaceProvider(cameraExecutor!!) { request ->
+                        val res = request.resolution
+                        glPipe?.stop(); h264Encoder?.stop()
+                        val enc = H264Encoder(res.width, res.height, 30, bitrateFor(res.width, res.height), true) { d, k -> broadcastH264(d, k) }
+                        h264Encoder = enc
+                        streamingServerHelper?.resetH264Wait()
+                        val pipe = CameraGlPipe(enc.inputSurface!!, res.width, res.height); pipe.start()
+                        glPipe = pipe
+                        request.provideSurface(pipe.inputSurface, cameraExecutor!!) { }
+                    }
                     useCases.add(preview)
+                } else {
+                    // camerax-analysis (default): ImageAnalysis -> NV12 -> encoder (real, CPU-bound ~9fps) + MJPEG
+                    useCases.add(imageAnalyzer!!)
                 }
 
                 // Bind to Service Lifecycle
@@ -460,6 +650,9 @@ class StreamingService : LifecycleService() {
     }
 
     private fun getCameraId(cameraManager: CameraManager): String {
+        // Explicit camera id chosen from the device list takes priority over facing.
+        val pref = PreferenceManager.getDefaultSharedPreferences(this).getString("camera_id", "") ?: ""
+        if (pref.isNotEmpty() && cameraManager.cameraIdList.contains(pref)) return pref
         return when (lensFacing) {
             CameraSelector.DEFAULT_BACK_CAMERA -> {
                 cameraManager.cameraIdList.find { id ->
@@ -480,69 +673,97 @@ class StreamingService : LifecycleService() {
     private fun applyCameraSettings() {
         val cam = camera ?: return
         val prefs = PreferenceManager.getDefaultSharedPreferences(this)
-
-        // Torch
+        val id = camId()  // per-camera settings
         try {
-            val torchPref = prefs.getString("camera_torch", "off") ?: "off"
-            if (cam.cameraInfo.hasFlashUnit()) {
-                cam.cameraControl.enableTorch(torchPref == "on")
-            }
+            if (cam.cameraInfo.hasFlashUnit())
+                cam.cameraControl.enableTorch(prefs.getString("camera_torch_$id", "off") == "on")
         } catch (e: Exception) { Log.w(TAG, "Torch error: ${e.message}") }
-
-        // Zoom
-        val requestedZoomFactor = prefs.getString("camera_zoom", "1.0")?.toFloatOrNull() ?: 1.0f
-        cam.cameraControl.setZoomRatio(requestedZoomFactor)
-
-        // Exposure
-        val exposureValue = prefs.getString("camera_exposure", "0")?.toIntOrNull() ?: 0
-        cam.cameraControl.setExposureCompensationIndex(exposureValue)
+        cam.cameraControl.setZoomRatio(prefs.getString("camera_zoom_$id", "1.0")?.toFloatOrNull() ?: 1.0f)
+        cam.cameraControl.setExposureCompensationIndex(prefs.getString("camera_exposure_$id", "0")?.toIntOrNull() ?: 0)
     }
 
+    /**
+     * Remote control API — called from `GET /?<key>=<value>` (proxied as /api/video/control?<key>=<value>):
+     *   torch=on|off|toggle        flashlight
+     *   focus=1                    one-shot autofocus
+     *   camera=<id>|front|back     select camera (ids come from GET /cameras)
+     *   backend=camera2-gl|camera1-gl|camerax-gl|camerax-analysis
+     *   resolution=480|720|1080    target height (the camera uses its nearest native size)
+     *   image controls (per-camera, live; supported set per API from GET /controls?backend=):
+     *     exposure=<ev>  fps=1..60(cap)  iso  zoom  wb  effect  scene  focusmode  antibanding  stabilization=on|off
+     *   contrast=-50..50  rotate=90 (increments)   scale=0.5..2.0   delay=10..1000ms   audio_gain=0.5..3.0
+     */
     private fun handleRemoteControl(key: String, value: String) {
         val prefs = PreferenceManager.getDefaultSharedPreferences(this)
         val cam = camera
+        val id = camId()  // per-camera settings namespace
+
+        // Generic image controls (exposure/fps/iso/wb/effect/scene/focusmode/antibanding/stabilization/zoom):
+        // persist per-camera and apply LIVE to whichever backend is active (no stream restart).
+        if (key in ctlKeys) {
+            prefs.edit().putString("camera_${key}_$id", value).apply()
+            launchMain {
+                camera2Capture?.applyParam(key, value); camera1Capture?.applyParam(key, value)
+                if (key == "exposure") cam?.cameraControl?.setExposureCompensationIndex(value.toIntOrNull() ?: 0)
+                if (key == "zoom") cam?.cameraControl?.setZoomRatio(value.toFloatOrNull() ?: 1f)
+            }
+            return
+        }
 
         when (key) {
             "torch" -> {
-                val current = prefs.getString("camera_torch", "off") ?: "off"
+                val current = prefs.getString("camera_torch_$id", "off") ?: "off"
                 val next = when (value.lowercase()) {
                     "on" -> "on"
                     "off" -> "off"
                     "toggle" -> if (current == "on") "off" else "on"
                     else -> return
                 }
-                prefs.edit().putString("camera_torch", next).apply()
-                launchMain {
-                    try {
-                        if (cam?.cameraInfo?.hasFlashUnit() == true) {
-                            cam.cameraControl.enableTorch(next == "on")
-                        }
-                    } catch (e: Exception) {}
-                }
-            }
-            "zoom" -> {
-                val zoomFactor = value.toFloatOrNull() ?: return
-                prefs.edit().putString("camera_zoom", zoomFactor.toString()).apply()
-                launchMain { cam?.cameraControl?.setZoomRatio(zoomFactor) }
-            }
-            "exposure" -> {
-                val exposure = value.toIntOrNull() ?: return
-                prefs.edit().putString("camera_exposure", exposure.toString()).apply()
-                launchMain { cam?.cameraControl?.setExposureCompensationIndex(exposure) }
+                prefs.edit().putString("camera_torch_$id", next).apply()
+                launchMain { setTorchAll(next == "on") }
             }
             "contrast" -> {
                 val contrast = value.toIntOrNull() ?: return
                 prefs.edit().putString("camera_contrast", contrast.toString()).apply()
-                Log.i(TAG, "Remote Control: Contrast set to $contrast (software-based)")
             }
             "resolution" -> {
-                if (value in listOf("low", "medium", "high")) {
-                    prefs.edit().putString("camera_resolution", value).apply()
-                    launchMain { startCamera() } // Restart
+                if (value in listOf("low", "medium", "high", "480", "720", "1080", "hd", "fhd")) {
+                    prefs.edit().putString("camera_resolution_$id", value).remove("camera_size_$id").apply()
+                    launchMain { if (isCameraRunning()) startCamera() }
+                }
+            }
+            "size" -> {
+                if (Regex("\\d+x\\d+").matches(value)) {  // exact device size chosen from /cameras
+                    prefs.edit().putString("camera_size_$id", value).apply()
+                    launchMain { if (isCameraRunning()) startCamera() }
                 }
             }
             "camera" -> {
-                 switchCamera()
+                val cm = getSystemService(Context.CAMERA_SERVICE) as CameraManager
+                val ids = try { cm.cameraIdList.toList() } catch (e: Exception) { emptyList() }
+                if (value in ids) {
+                    // explicit camera id picked from the device list
+                    prefs.edit().putString("camera_id", value).apply()
+                    val f = try { cm.getCameraCharacteristics(value).get(CameraCharacteristics.LENS_FACING) } catch (e: Exception) { null }
+                    lensFacing = if (f == CameraCharacteristics.LENS_FACING_FRONT) CameraSelector.DEFAULT_FRONT_CAMERA else CameraSelector.DEFAULT_BACK_CAMERA
+                } else {
+                    prefs.edit().remove("camera_id").apply()  // back to facing-based
+                    lensFacing = when {
+                        value.equals("front", true) -> CameraSelector.DEFAULT_FRONT_CAMERA
+                        value.equals("back", true) -> CameraSelector.DEFAULT_BACK_CAMERA
+                        else -> if (lensFacing == CameraSelector.DEFAULT_FRONT_CAMERA) CameraSelector.DEFAULT_BACK_CAMERA else CameraSelector.DEFAULT_FRONT_CAMERA
+                    }
+                }
+                prefs.edit().putString(PREF_LAST_CAMERA_FACING,
+                    if (lensFacing == CameraSelector.DEFAULT_FRONT_CAMERA) CAMERA_FACING_FRONT else CAMERA_FACING_BACK).apply()
+                launchMain { if (isCameraRunning()) startCamera() } // rebind chosen camera for MJPEG or H.264
+            }
+            "focus" -> launchMain { triggerFocusAll() }
+            "backend" -> {
+                if (value in listOf("camerax-analysis", "camerax-gl", "camera2-gl", "camera1-gl", "mjpeg")) {
+                    prefs.edit().putString("capture_backend", value).apply()
+                    launchMain { if (isCameraRunning()) startCamera() } // restart only if already streaming
+                }
             }
             // Other settings like scale/delay/rotate are handled in processImage
             "scale" -> {
